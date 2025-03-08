@@ -52,7 +52,7 @@
         // Global variables
         let mesh;
         let modelCentroid = new THREE.Vector3(0, 0, 1);
-        let usingCustomShader = true;
+        let usingCustomShader = false;
         const originalMaterials = new Map();
         let initialPixelCounts = null;
         let hasCalculatedInitialCounts = false;
@@ -80,7 +80,7 @@
 
         // Load a model automatically when the page loads
         // Add this line to load your default model
-        loadModel('buen_7.glb'); // Replace with your actual model filename
+        loadModel('buen_3.glb'); // Replace with your actual model filename
 
         // Function to reset camera animation
         function resetCameraAnimation() {
@@ -518,111 +518,285 @@
 
                 hasCalculatedInitialCounts = false; // Reset when switching back to original
             } else {
-                // Store the current material if it's not already stored
+                // Store original material
                 if (!originalMaterials.has(mesh)) {
                     originalMaterials.set(mesh, mesh.material.clone());
-                    console.log("Stored original material");
                 }
 
-                // Initialize the render target and counting scene with higher resolution
-                const renderTargetSize = {
-                    width: renderer.domElement.width / 2,
-                    height: renderer.domElement.height / 2
-                };
-
-                const result = createTriangleCountingRenderer(
-                    renderTargetSize.width,
-                    renderTargetSize.height
-                );
-
-                renderTarget = result.renderTarget;
-                countingScene = result.countingScene;
-
-                // Create triangle ID material
                 const geometry = mesh.geometry;
                 const triangleCount = geometry.index ? geometry.index.count / 3 : geometry.attributes.position.count / 3;
 
-                // Ensure geometry has triangleId attribute
-                if (!geometry.attributes.triangleId) {
-                    if (geometry.index) {
-                        const indexCount = geometry.index.count;
-                        const triangleIds = new Float32Array(indexCount);
+                // Check if we've already stored initial areas
+                const hasInitialAreas = geometry.attributes.initialArea !== undefined;
 
-                        for (let i = 0; i < indexCount; i++) {
-                            triangleIds[i] = Math.floor(i / 3); // Integer ID per triangle
+                // Add additional attributes to store triangle data
+                if (!geometry.attributes.triangleV1 || !geometry.attributes.triangleV2 || !geometry.attributes.triangleV3) {
+                    console.log("Creating triangle vertex attributes");
+                    const positions = geometry.attributes.position.array;
+                    const indices = geometry.index ? geometry.index.array : null;
+                    const vertexCount = geometry.attributes.position.count;
+
+                    // Create arrays for the triangle vertices
+                    const triangleV1 = new Float32Array(vertexCount * 3);
+                    const triangleV2 = new Float32Array(vertexCount * 3);
+                    const triangleV3 = new Float32Array(vertexCount * 3);
+
+                    // For each triangle, store its vertices in attributes
+                    for (let i = 0; i < triangleCount; i++) {
+                        // Get vertex indices for this triangle
+                        let v1Idx, v2Idx, v3Idx;
+                        if (indices) {
+                            v1Idx = indices[i * 3];
+                            v2Idx = indices[i * 3 + 1];
+                            v3Idx = indices[i * 3 + 2];
+                        } else {
+                            v1Idx = i * 3;
+                            v2Idx = i * 3 + 1;
+                            v3Idx = i * 3 + 2;
                         }
 
-                        geometry.setAttribute('triangleId', new THREE.BufferAttribute(triangleIds, 1));
-                    } else {
-                        const vertexCount = geometry.attributes.position.count;
-                        const triangleIds = new Float32Array(vertexCount);
+                        // Get vertex positions from the position buffer
+                        const v1 = {
+                            x: positions[v1Idx * 3],
+                            y: positions[v1Idx * 3 + 1],
+                            z: positions[v1Idx * 3 + 2]
+                        };
+                        const v2 = {
+                            x: positions[v2Idx * 3],
+                            y: positions[v2Idx * 3 + 1],
+                            z: positions[v2Idx * 3 + 2]
+                        };
+                        const v3 = {
+                            x: positions[v3Idx * 3],
+                            y: positions[v3Idx * 3 + 1],
+                            z: positions[v3Idx * 3 + 2]
+                        };
 
-                        for (let i = 0; i < vertexCount; i++) {
-                            triangleIds[i] = Math.floor(i / 3); // Integer ID per triangle
+                        // For each vertex of this triangle, store all three vertices
+                        // This ensures each vertex shader invocation has access to the full triangle
+                        for (let j = 0; j < 3; j++) {
+                            let vIdx;
+                            if (indices) {
+                                vIdx = indices[i * 3 + j];
+                            } else {
+                                vIdx = i * 3 + j;
+                            }
+
+                            // Store all three triangle vertices at this vertex's position in the buffers
+                            triangleV1[vIdx * 3] = v1.x;
+                            triangleV1[vIdx * 3 + 1] = v1.y;
+                            triangleV1[vIdx * 3 + 2] = v1.z;
+
+                            triangleV2[vIdx * 3] = v2.x;
+                            triangleV2[vIdx * 3 + 1] = v2.y;
+                            triangleV2[vIdx * 3 + 2] = v2.z;
+
+                            triangleV3[vIdx * 3] = v3.x;
+                            triangleV3[vIdx * 3 + 1] = v3.y;
+                            triangleV3[vIdx * 3 + 2] = v3.z;
                         }
-
-                        geometry.setAttribute('triangleId', new THREE.BufferAttribute(triangleIds, 1));
                     }
+
+                    // Add the triangle vertex attributes to the geometry
+                    geometry.setAttribute('triangleV1', new THREE.BufferAttribute(triangleV1, 3));
+                    geometry.setAttribute('triangleV2', new THREE.BufferAttribute(triangleV2, 3));
+                    geometry.setAttribute('triangleV3', new THREE.BufferAttribute(triangleV3, 3));
                 }
 
-                // Create a clone of the mesh with triangle ID material for counting
-                const idMaterial = createTriangleIDMaterial(triangleCount);
-                const countingMesh = mesh.clone();
-                countingMesh.material = idMaterial;
-                countingScene.add(countingMesh);
+                // If this is the first time, create the initialArea attribute
+                if (!hasInitialAreas) {
+                    const vertexCount = geometry.attributes.position.count;
+                    const initialAreaArray = new Float32Array(vertexCount);
+                    geometry.setAttribute('initialArea', new THREE.BufferAttribute(initialAreaArray, 1));
 
-                // Render the counting scene to get initial pixel counts
-                renderer.setRenderTarget(renderTarget);
-                renderer.render(countingScene, camera);
-                renderer.setRenderTarget(null);
-
-                // Count pixels for each triangle
-                initialPixelCounts = countTrianglePixels(renderer, renderTarget, triangleCount);
-                hasCalculatedInitialCounts = true;
-
-                // Log some statistics about initial pixel counts
-                let totalPixels = 0;
-                let minPixels = Infinity;
-                let maxPixels = 0;
-                let zeroCount = 0;
-
-                for (let i = 0; i < initialPixelCounts.length; i++) {
-                    totalPixels += initialPixelCounts[i];
-                    minPixels = Math.min(minPixels, initialPixelCounts[i]);
-                    maxPixels = Math.max(maxPixels, initialPixelCounts[i]);
-                    if (initialPixelCounts[i] === 0) zeroCount++;
+                    // Flag to track initialization
+                    mesh.userData.initialAreasCalculated = false;
                 }
 
-                console.log(`Initial pixel count stats:
-                    Total triangles: ${initialPixelCounts.length}
-                    Total pixels: ${totalPixels}
-                    Min pixels per triangle: ${minPixels}
-                    Max pixels per triangle: ${maxPixels}
-                    Triangles with zero pixels: ${zeroCount}
-                `);
-
-                // Create a simple initial shader for the main view
-                const visualizationMaterial = new THREE.ShaderMaterial({
+                // Create shader material that handles both initialization and visualization
+                const areaShader = new THREE.ShaderMaterial({
+                    uniforms: {
+                        isFirstFrame: { value: !mesh.userData.initialAreasCalculated ? 1.0 : 0.0 },
+                        sigmoidSteepness: { value: 5.0 }
+                    },
                     vertexShader: `
                         in float triangleId;
+                        in float initialArea;
+                        in vec3 triangleV1;
+                        in vec3 triangleV2;
+                        in vec3 triangleV3;
+                        
                         flat out float vTriangleId;
+                        flat out float vInitialArea;
+                        out vec4 vScreenPosition;
+                        flat out vec4 vScreenV1;
+                        flat out vec4 vScreenV2;
+                        flat out vec4 vScreenV3;
+                        
+                        // Function to calculate screen-space coordinates
+                        vec2 getScreenCoords(vec4 clipSpace) {
+                            vec3 ndc = clipSpace.xyz / clipSpace.w;
+                            return ndc.xy * 0.5 + 0.5;
+                        }
+                        
+                        // Function to calculate the screen-space area of a triangle
+                        float calculateScreenArea(vec2 p1, vec2 p2, vec2 p3) {
+                            // Calculate area using cross product
+                            float area = abs((p2.x - p1.x) * (p3.y - p1.y) - (p3.x - p1.x) * (p2.y - p1.y)) * 0.5;
+                            return area;
+                        }
+                        
                         void main() {
                             vTriangleId = triangleId;
-                            gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+                            vInitialArea = initialArea;
+                            
+                            // Calculate clip-space positions for all three vertices of the triangle
+                            vec4 clipV1 = projectionMatrix * modelViewMatrix * vec4(triangleV1, 1.0);
+                            vec4 clipV2 = projectionMatrix * modelViewMatrix * vec4(triangleV2, 1.0);
+                            vec4 clipV3 = projectionMatrix * modelViewMatrix * vec4(triangleV3, 1.0);
+                            
+                            // Store the clip-space positions to pass to the fragment shader
+                            vScreenV1 = clipV1;
+                            vScreenV2 = clipV2;
+                            vScreenV3 = clipV3;
+                            
+                            // Actual vertex position for this vertex
+                            vec4 worldPos = modelViewMatrix * vec4(position, 1.0);
+                            gl_Position = projectionMatrix * worldPos;
+                            vScreenPosition = gl_Position;
                         }
                     `,
                     fragmentShader: `
+                        uniform float isFirstFrame;
+                        uniform float sigmoidSteepness;
+                        
                         flat in float vTriangleId;
+                        flat in float vInitialArea;
+                        in vec4 vScreenPosition;
+                        flat in vec4 vScreenV1;
+                        flat in vec4 vScreenV2;
+                        flat in vec4 vScreenV3;
+                        
                         out vec4 fragColor;
                         
+                        // Function to calculate screen-space coordinates
+                        vec2 getScreenCoords(vec4 clipSpace) {
+                            vec3 ndc = clipSpace.xyz / clipSpace.w;
+                            return ndc.xy * 0.5 + 0.5;
+                        }
+                        
+                        // Function to calculate the screen-space area of a triangle
+                        float calculateScreenArea(vec4 p1, vec4 p2, vec4 p3) {
+                            // Convert to screen space coordinates
+                            vec2 s1 = getScreenCoords(p1);
+                            vec2 s2 = getScreenCoords(p2);
+                            vec2 s3 = getScreenCoords(p3);
+                            
+                            // Calculate area using cross product
+                            vec2 e1 = s2 - s1;
+                            vec2 e2 = s3 - s1;
+                            return abs(e1.x * e2.y - e1.y * e2.x) * 0.5;
+                        }
+                        
+                        // Sigmoid function for smooth transition
+                        float sigmoid(float x) {
+                            return 1.0 / (1.0 + exp(-x));
+                        }
+                        
                         void main() {
-                            // Initial state - medium gray for all triangles
-                            fragColor = vec4(0.5, 0.5, 0.5, 1.0);
+                            // Calculate the current triangle's screen-space area using the vertices passed from vertex shader
+                            float currentScreenArea = calculateScreenArea(vScreenV1, vScreenV2, vScreenV3);
+                            
+                            // Use triangle ID for initial debug visualization
+                            float triangleId = vTriangleId;
+                            
+                            // Rainbow color based on triangle ID for debugging
+                            vec3 rainbowColor = vec3(
+                                0.5 + 0.5 * sin(triangleId * 0.1),
+                                0.5 + 0.5 * sin(triangleId * 0.1 + 2.0),
+                                0.5 + 0.5 * sin(triangleId * 0.1 + 4.0)
+                            );
+                            
+                            if (isFirstFrame > 0.5) {
+                                // First frame - just show the triangle IDs and don't compare areas yet
+                                fragColor = vec4(rainbowColor, 1.0);
+                                return;
+                            }
+                            
+                            // Get the stored initial area value
+                            float initialArea = max(0.00001, vInitialArea);
+                            
+                            // Calculate ratio of current to initial area
+                            float ratio = currentScreenArea / initialArea;
+                            
+                            // Apply log transformation to make ratio changes more visible
+                            float logRatio = log(max(0.00001, ratio));
+                            
+                            // Use sigmoid to map to 0-1 range
+                            float t = sigmoid(sigmoidSteepness * logRatio);
+                            
+                            // Create color scale from blue (more visible) to red (less visible)
+                            vec3 color;
+                            if (t < 0.4) {
+                                // Blue range - significantly more visible now
+                                color = mix(
+                                    vec3(0.0, 0.0, 0.8), // Dark blue (much more visible)
+                                    vec3(0.2, 0.4, 0.8), // Light blue (somewhat more visible)
+                                    t / 0.4
+                                );
+                            } else if (t < 0.6) {
+                                // Neutral range - about the same visibility
+                                color = mix(
+                                    vec3(0.2, 0.4, 0.8), // Light blue
+                                    vec3(0.8, 0.4, 0.2), // Light red
+                                    (t - 0.4) / 0.2
+                                );
+                            } else {
+                                // Red range - significantly less visible now
+                                color = mix(
+                                    vec3(0.8, 0.4, 0.2), // Light red (somewhat less visible)
+                                    vec3(0.8, 0.0, 0.0), // Dark red (much less visible)
+                                    (t - 0.6) / 0.4
+                                );
+                            }
+                            
+                            // Ensure minimum brightness
+                            color = max(color, vec3(0.2));
+                            
+                            // Uncomment for raw ratio testing:
+                            color = vec3(clamp(ratio * 0.9, 0.0, 1.0), clamp(ratio * 0.9, 0.0, 1.0),clamp(ratio * 0.9, 0.0, 1.0));
+                            
+                            fragColor = vec4(color, 1.0);
                         }
                     `,
                     glslVersion: THREE.GLSL3
                 });
-                mesh.material = visualizationMaterial;
+
+                // Apply the shader
+                mesh.material = areaShader;
+
+                // After the first render, we need to copy the screen-space areas
+                if (!mesh.userData.initialAreasCalculated) {
+                    requestAnimationFrame(() => {
+                        console.log("Capturing initial screen-space areas");
+
+                        // Toggle the flag in both the mesh and shader
+                        mesh.userData.initialAreasCalculated = true;
+                        areaShader.uniforms.isFirstFrame.value = 0.0;
+
+                        // Here we would ideally read back from a render target
+                        // For simulation, we'll calculate directly in a second pass
+
+                        // Remember current camera position to reference initial viewing conditions
+                        mesh.userData.initialCameraPosition = camera.position.clone();
+                        mesh.userData.initialCameraRotation = camera.rotation.clone();
+
+                        // Re-render to update the shader with the new state
+                        renderer.render(scene, camera);
+
+                        console.log("Switched to area comparison mode");
+                    });
+                }
             }
 
             usingCustomShader = !usingCustomShader;
@@ -655,21 +829,24 @@
                 // Calculate current cycle number (0-based)
                 const currentCycle = Math.floor(elapsedTime / cameraAnimationState.cycleDuration);
 
-                // Check if we're starting a new cycle
-                if (cycleTime < 0.1 && frameCount % 10 === 0) { // Check only occasionally to avoid multiple toggles
-                    // Get the previous cycle number
-                    const previousCycle = Math.floor((elapsedTime - 0.2) / cameraAnimationState.cycleDuration);
+                // Store last cycle to detect changes
+                if (mesh && !mesh.userData.lastAnimationCycle) {
+                    mesh.userData.lastAnimationCycle = -1;
+                }
 
-                    // If we've moved to a new cycle
-                    if (currentCycle > previousCycle) {
-                        console.log(`Starting new camera animation cycle: ${currentCycle}`);
+                // Check if we've moved to a new cycle
+                if (mesh && currentCycle > mesh.userData.lastAnimationCycle) {
+                    console.log(`Starting new camera animation cycle: ${currentCycle}`);
 
-                        // Toggle shader at the beginning of each new cycle (except the very first one)
-                        if (currentCycle > 0) {
-                            toggleMaterial();
-                            console.log(`Toggled shader state to: ${usingCustomShader ? 'custom shader' : 'original material'}`);
-                        }
+                    // Toggle shader at the beginning of each new cycle (except the very first one)
+                    if (currentCycle > 0) {
+                        console.log(`Toggling shader at cycle ${currentCycle}`);
+                        toggleMaterial();
+                        console.log(`Toggled shader state to: ${usingCustomShader ? 'custom shader' : 'original material'}`);
                     }
+
+                    // Update stored cycle
+                    mesh.userData.lastAnimationCycle = currentCycle;
                 }
 
                 // Define animation phases
@@ -770,147 +947,134 @@
             // Existing shader update code - only run when custom shader is active
             if (mesh && usingCustomShader && hasCalculatedInitialCounts && frameCount % updateInterval === 0) {
                 try {
-                    // Render the counting scene with the current camera position
-                    renderer.setRenderTarget(renderTarget);
-                    renderer.render(countingScene, camera);
-                    renderer.setRenderTarget(null);
+                    const geometry = mesh.geometry;
+                    const triangleCount = geometry.index ? geometry.index.count / 3 : geometry.attributes.position.count / 3;
 
-                    // Count pixels for each triangle
-                    const triangleCount = initialPixelCounts.length;
-                    const currentPixelCounts = countTrianglePixels(renderer, renderTarget, triangleCount);
+                    // Check if we've already stored initial areas
+                    const hasInitialAreas = geometry.attributes.initialArea !== undefined;
 
-                    // Calculate pixel count differences
-                    const pixelDifferences = new Float32Array(triangleCount);
-                    let minRatio = Infinity;
-                    let maxRatio = -Infinity;
-                    const smoothingFactor = 0.1; // Smoothing factor to avoid division by zero
+                    // If this is the first time, we need to create the attribute
+                    if (!hasInitialAreas) {
+                        console.log("Creating initialArea attribute for the first time");
 
-                    // Log statistics for current frame
-                    let totalCurrentPixels = 0;
-                    let totalInitialPixels = 0;
-                    let zeroToNonZero = 0;
-                    let nonZeroToZero = 0;
+                        // Create arrays to store the per-vertex area values
+                        const vertexCount = geometry.attributes.position.count;
+                        const initialAreaArray = new Float32Array(vertexCount);
 
-                    for (let i = 0; i < triangleCount; i++) {
-                        const initialCount = initialPixelCounts[i];
-                        const currentCount = currentPixelCounts[i];
+                        // Create the attribute (we'll populate it in the shader)
+                        geometry.setAttribute('initialArea', new THREE.BufferAttribute(initialAreaArray, 1));
 
-                        totalInitialPixels += initialCount;
-                        totalCurrentPixels += currentCount;
-
-                        if (initialCount === 0 && currentCount > 0) zeroToNonZero++;
-                        if (initialCount > 0 && currentCount === 0) nonZeroToZero++;
-
-                        // Calculate the ratio with smoothing factor to avoid division by zero
-                        pixelDifferences[i] = (initialCount + smoothingFactor) / (currentCount + smoothingFactor);
-
-                        // Track min and max for normalization
-                        minRatio = Math.min(minRatio, pixelDifferences[i]);
-                        maxRatio = Math.max(maxRatio, pixelDifferences[i]);
+                        // Flag to track initialization
+                        mesh.userData.initialAreasCalculated = false;
                     }
 
-                    /*console.log(`Frame ${frameCount} pixel stats:
-                        Total initial pixels: ${totalInitialPixels}
-                        Total current pixels: ${totalCurrentPixels}
-                        Change: ${((totalCurrentPixels - totalInitialPixels) / totalInitialPixels * 100).toFixed(2)}%
-                        Triangles appearing: ${zeroToNonZero}
-                        Triangles disappearing: ${nonZeroToZero}
-                        Diff range: ${minDiff.toFixed(4)} to ${maxDiff.toFixed(4)}
-                    `);*/
-
-                    // Ensure we have a reasonable range
-                    if (maxRatio - minRatio < 0.001) {
-                        maxRatio = minRatio + 0.001;
-                    }
-
-                    // Create or update data texture
-                    const textureSize = Math.ceil(Math.sqrt(pixelDifferences.length));
-                    const paddedData = new Float32Array(textureSize * textureSize);
-                    for (let i = 0; i < pixelDifferences.length; i++) {
-                        paddedData[i] = pixelDifferences[i];
-                    }
-
-                    if (!dataTexture) {
-                        dataTexture = new THREE.DataTexture(
-                            paddedData,
-                            textureSize,
-                            textureSize,
-                            THREE.RedFormat,
-                            THREE.FloatType
-                        );
-                    } else {
-                        dataTexture.image.data = paddedData;
-                    }
-                    dataTexture.needsUpdate = true;
-
-                    // Create a new shader material with the texture
-                    const updatedMaterial = new THREE.ShaderMaterial({
+                    // Create shader material that handles both initialization and visualization
+                    const areaShader = new THREE.ShaderMaterial({
                         uniforms: {
-                            pixelDiffTexture: { value: dataTexture },
-                            textureSize: { value: textureSize },
-                            minRatio: { value: minRatio },
-                            maxRatio: { value: maxRatio },
-                            ratioThreshold: { value: 1.0 }, // Threshold between inpaint needed vs not needed
-                            sigmoidSteepness: { value: 6.0 } // Controls how steep the sigmoid curve is
+                            isFirstFrame: { value: !mesh.userData.initialAreasCalculated ? 1.0 : 0.0 },
+                            sigmoidSteepness: { value: 6.0 },
+                            debugScale: { value: 100.0 }
                         },
                         vertexShader: `
                             in float triangleId;
+                            in float initialArea;  // Will be 0 on first frame, populated after
+                            
+                            out vec3 vPosition;
                             flat out float vTriangleId;
+                            flat out float vInitialArea;
+                            out vec4 vScreenPosition;
+                            
                             void main() {
                                 vTriangleId = triangleId;
-                                gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+                                vPosition = position;
+                                vInitialArea = initialArea;
+                                
+                                vec4 worldPos = modelViewMatrix * vec4(position, 1.0);
+                                gl_Position = projectionMatrix * worldPos;
+                                vScreenPosition = gl_Position;
                             }
                         `,
                         fragmentShader: `
-                            uniform sampler2D pixelDiffTexture;
-                            uniform float textureSize;
-                            uniform float minRatio;
-                            uniform float maxRatio;
-                            uniform float ratioThreshold;
+                            uniform float isFirstFrame;
                             uniform float sigmoidSteepness;
+                            uniform float debugScale;
+                            
+                            in vec3 vPosition;
                             flat in float vTriangleId;
+                            flat in float vInitialArea;
+                            in vec4 vScreenPosition;
+                            
                             out vec4 fragColor;
                             
-                            // Sigmoid function to create smooth transition
+                            // Function to calculate screen-space coordinates
+                            vec2 getScreenCoords(vec4 clipSpace) {
+                                vec3 ndc = clipSpace.xyz / clipSpace.w;
+                                return ndc.xy * 0.5 + 0.5;
+                            }
+                            
+                            // Sigmoid function for smooth transition
                             float sigmoid(float x) {
                                 return 1.0 / (1.0 + exp(-x));
                             }
                             
                             void main() {
-                                // Calculate texture coordinates from triangle ID
+                                // Calculate screen coordinates for current position
+                                vec2 screenCoord = getScreenCoords(vScreenPosition);
+                                
+                                // Use triangle ID for initial debug visualization
                                 float triangleId = vTriangleId;
-                                float texSize = textureSize;
-                                float y = floor(triangleId / texSize);
-                                float x = mod(triangleId, texSize);
-                                vec2 uv = vec2((x + 0.5) / texSize, (y + 0.5) / texSize);
                                 
-                                // Get pixel ratio from texture
-                                float ratio = texture(pixelDiffTexture, uv).r;
+                                if (isFirstFrame > 0.5) {
+                                    // First frame - show debug colors based on triangle ID
+                                    vec3 rainbowColor = vec3(
+                                        0.5 + 0.5 * sin(triangleId * 0.1),
+                                        0.5 + 0.5 * sin(triangleId * 0.1 + 2.0),
+                                        0.5 + 0.5 * sin(triangleId * 0.1 + 4.0)
+                                    );
+                                    fragColor = vec4(rainbowColor, 1.0);
+                                    return;
+                                }
                                 
-                                // Center sigmoid around ratio = 1.0 (log(1.0) = 0)
-                                // This way, a ratio of 1.0 will be in the middle of our transition
-                                float logRatio = log(ratio);
+                                // Current "area" - for now just using screen position 
+                                // Better approach would be to calculate actual screen-space triangle area
+                                float currentValue = length(screenCoord - vec2(0.5, 0.5)) * 2.0; // Distance from center * 2
                                 
-                                // Apply sigmoid function centered at ratio = 1.0
-                                float sigmoidValue = sigmoid(sigmoidSteepness * logRatio);
+                                // Get the stored initial area value
+                                float initialValue = max(0.00000001, vInitialArea); // Prevent division by zero
                                 
-                                // Use a cleaner color mapping scheme
-                                // For ratios < 1.0: more visible now (blue to gray)
-                                // For ratios > 1.0: less visible now, needs inpainting (gray to yellow/orange)
-                                vec3 lowColor = vec3(0.0, 0.2, 0.6);  // Dark blue for much more visible triangles
-                                vec3 midColor = vec3(0.5, 0.5, 0.5);  // Gray for unchanged triangles
-                                vec3 highColor = vec3(1.0, 0.7, 0.0);  // Bright orange for triangles needing inpainting
+                                // Calculate ratio of current to initial
+                                float ratio = initialValue / currentValue ;
                                 
-                                // Direct mapping from sigmoid output to color
-                                // When ratio = 1.0, sigmoid = 0.5, so we get midColor
-                                // Calculate mix factors that accurately correspond to the ratio values
-                                float lowToMidFactor = min(sigmoidValue * 2.0, 1.0);  // 0->0, 0.5->1.0
-                                float midToHighFactor = max(sigmoidValue * 2.0 - 1.0, 0.0);  // 0.5->0, 1.0->1.0
+                                // Create a smooth color gradient based on ratio
+                                // Log transform makes changes near 1.0 more visible
+                                float logRatio = log(max(0.01, ratio));
                                 
-                                // Choose color based on whether ratio is above or below 1.0
-                                vec3 color = ratio < 1.0 ? 
-                                    mix(lowColor, midColor, lowToMidFactor) : 
-                                    mix(midColor, highColor, midToHighFactor);
+                                // Map to a 0-1 range with sigmoid centered at 0 (ratio=1)
+                                float t = sigmoid(logRatio * 30.0); // Adjust steepness as needed
+                                
+                                // Use a smooth color gradient
+                                vec3 color;
+                                
+                                // Blue gradient for more visible triangles (ratio < 1)
+                                vec3 moreVisibleColor = mix(
+                                    vec3(0.0, 0.0, 0.0),  // Dark blue (much more visible)
+                                    vec3(0.2, 0.2, 0.2),  // Neutral blue-gray (slightly more visible)
+                                    smoothstep(0.0, 0.5, t)
+                                );
+                                
+                                // Red gradient for less visible triangles (ratio > 1)
+                                vec3 lessVisibleColor = mix(
+                                    vec3(0.8, 0.8, 0.8),  // Neutral red-gray (slightly less visible)
+                                    vec3(1.0, 1.0, 1.0),  // Dark red (much less visible)
+                                    smoothstep(0.5, 1.0, t)
+                                );
+                                
+                                // Blend between the two gradients
+                                color = mix(moreVisibleColor, lessVisibleColor, smoothstep(0.4, 0.6, t));
+                                
+                                // Ensure we have good brightness
+                                color = min(color, vec3(0.1));
+                                color = vec3(clamp(ratio, 0.0, 1.0),0.0, 0.0);
                                 
                                 fragColor = vec4(color, 1.0);
                             }
@@ -918,8 +1082,45 @@
                         glslVersion: THREE.GLSL3
                     });
 
-                    // Replace the material
-                    mesh.material = updatedMaterial;
+                    // Store the original material if we haven't already
+                    if (!originalMaterials.has(mesh)) {
+                        originalMaterials.set(mesh, mesh.material.clone());
+                    }
+
+                    // Apply the shader
+                    mesh.material = areaShader;
+
+                    // After the first render, we need to:
+                    // 1. Read back the calculated areas
+                    // 2. Store them in the initialArea attribute
+                    // 3. Set isFirstFrame to false
+                    if (!mesh.userData.initialAreasCalculated) {
+                        // Schedule a callback to update the attribute after render
+                        requestAnimationFrame(() => {
+                            console.log("Updating initialArea attribute with calculated values");
+
+                            // Here we would calculate the actual areas per triangle
+                            // For this example, we'll just assign values based on the triangle ID
+                            const vertexCount = geometry.attributes.position.count;
+                            const initialAreaArray = geometry.attributes.initialArea.array;
+
+                            // Assign a value to each vertex (ideally would be the actual area)
+                            for (let i = 0; i < vertexCount; i++) {
+                                // Just a placeholder value - in real code, we'd calculate this properly
+                                const triangleId = Math.floor(i / 3);
+                                initialAreaArray[i] = 0.1 + 0.1 * Math.sin(triangleId * 0.2);
+                            }
+
+                            // Mark the attribute as needing update
+                            geometry.attributes.initialArea.needsUpdate = true;
+
+                            // Set the flag to false after the first frame
+                            areaShader.uniforms.isFirstFrame.value = 1.0;
+                            mesh.userData.initialAreasCalculated = true;
+
+                            console.log("Initial areas stored in vertex attribute");
+                        });
+                    }
                 } catch (error) {
                     console.error("Error in animation loop:", error);
                 }
