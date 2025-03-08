@@ -1,0 +1,882 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <title>Shader mask generator</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+        }
+
+        canvas {
+            display: block;
+        }
+    </style>
+</head>
+
+<body>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.162.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.162.0/examples/jsm/"
+            }
+        }
+    </script>
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+        // Scene setup
+        const scene = new THREE.Scene();
+        const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        document.body.appendChild(renderer.domElement);
+
+        // Orbit controls
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.05;
+
+        // Lighting
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
+        scene.add(ambientLight);
+        const directionalLight = new THREE.DirectionalLight(0xffffff, 0.5);
+        directionalLight.position.set(5, 5, 5);
+        scene.add(directionalLight);
+
+        // Global variables
+        let mesh;
+        let modelCentroid = new THREE.Vector3(0, 0, 1);
+        let usingCustomShader = true;
+        const originalMaterials = new Map();
+        let initialPixelCounts = null;
+        let hasCalculatedInitialCounts = false;
+        let frameCount = 0;
+        const updateInterval = 10;
+        let dataTexture = null;
+        let triangleColorMap = null;
+        let triangleCountTexture = null;
+        let initialNormalDots = null;
+        let hasCalculatedInitialDots = false;
+        let renderTarget, countingScene;
+        let currentModelGroup = null; // Group to hold the current model
+
+        // Add camera animation variables
+        let cameraAnimationState = {
+            isActive: false,
+            startTime: 0,
+            originalPosition: new THREE.Vector3(),
+            originalRotation: new THREE.Euler(),
+            lookDirection: new THREE.Vector3(),
+            cycleComplete: false,
+            cycleDuration: 16, // Total seconds for one complete cycle (3s wait + 10s movement + 3s pause)
+            pauseBetweenCycles: 3 // Seconds to pause between cycles
+        };
+
+        // Load a model automatically when the page loads
+        // Add this line to load your default model
+        loadModel('./buen_3.glb'); // Replace with your actual model filename
+
+        // Function to reset camera animation
+        function resetCameraAnimation() {
+            // Store current camera position and rotation
+            cameraAnimationState.originalPosition.copy(camera.position);
+            cameraAnimationState.originalRotation.copy(camera.rotation);
+
+            // Calculate look direction (normalized)
+            cameraAnimationState.lookDirection = new THREE.Vector3(0, 0, 1);
+            cameraAnimationState.lookDirection.applyQuaternion(camera.quaternion);
+            cameraAnimationState.lookDirection.normalize();
+
+            // Reset animation state
+            cameraAnimationState.isActive = true;
+            cameraAnimationState.startTime = Date.now();
+            cameraAnimationState.cycleComplete = false;
+
+            console.log('Camera animation reset');
+        }
+
+        // Function to load a GLB model
+        function loadModel(filename) {
+            console.log(`Loading model: ${filename}`);
+
+            // Unload current model if it exists
+            if (currentModelGroup) {
+                // Remove from scene
+                scene.remove(currentModelGroup);
+
+                // Dispose of geometries and materials
+                currentModelGroup.traverse((child) => {
+                    if (child.isMesh) {
+                        if (child.geometry) {
+                            child.geometry.dispose();
+                        }
+                        if (child.material) {
+                            if (Array.isArray(child.material)) {
+                                child.material.forEach(material => material.dispose());
+                            } else {
+                                child.material.dispose();
+                            }
+                        }
+                    }
+                });
+
+                // Clear references
+                currentModelGroup = null;
+                mesh = null;
+                originalMaterials.clear();
+
+                // Reset shader state
+                usingCustomShader = true;
+                hasCalculatedInitialCounts = false;
+                initialPixelCounts = null;
+                dataTexture = null;
+
+                // Clean up render targets if they exist
+                if (renderTarget) {
+                    renderTarget.dispose();
+                    renderTarget = null;
+                }
+
+                console.log('Previous model unloaded');
+            }
+
+            // Create a new group for the model
+            currentModelGroup = new THREE.Group();
+            scene.add(currentModelGroup);
+
+            // Reset camera to initial position
+            camera.position.set(0, 0, 0);
+            camera.rotation.set(0, 0, Math.PI);
+
+            // Load the new GLB file
+            const loader = new GLTFLoader();
+            const glbUrl = `./${filename}`;
+
+            loader.load(glbUrl, (gltf) => {
+                // Add the loaded scene to our model group
+                currentModelGroup.add(gltf.scene);
+
+                // Find all meshes in the scene
+                let meshesWithGeometry = [];
+                gltf.scene.traverse((child) => {
+                    if (child.isMesh && child.geometry) {
+                        originalMaterials.set(child, child.material);
+                        meshesWithGeometry.push(child);
+                    }
+                });
+
+                // Use the first mesh with geometry
+                if (meshesWithGeometry.length > 0) {
+                    mesh = meshesWithGeometry[0];
+
+                    // Calculate the centroid of the model's vertices
+                    const geometry = mesh.geometry;
+                    const positionAttribute = geometry.attributes.position;
+                    const vertexCount = positionAttribute.count;
+
+                    // Initialize centroid and create a bounding box
+                    modelCentroid.set(0, 0, 0);
+                    const boundingBox = new THREE.Box3();
+
+                    // Calculate bounding box and sum all vertex positions
+                    const vertex = new THREE.Vector3();
+                    for (let i = 0; i < vertexCount; i++) {
+                        vertex.fromBufferAttribute(positionAttribute, i);
+                        // Apply mesh's world transform to get world position
+                        vertex.applyMatrix4(mesh.matrixWorld);
+                        boundingBox.expandByPoint(vertex);
+                        modelCentroid.add(vertex);
+                    }
+
+                    // Divide by vertex count to get average
+                    if (vertexCount > 0) {
+                        modelCentroid.divideScalar(vertexCount);
+                    }
+
+                    console.log('Model centroid:', modelCentroid);
+                    console.log('Bounding box:', boundingBox);
+
+                    // Update camera to look at the model centroid
+                    camera.lookAt(modelCentroid);
+                    controls.target.copy(modelCentroid);
+
+                    // Calculate the required FOV to frame the bounding box
+                    fitCameraToObject(camera, boundingBox, modelCentroid);
+
+                    controls.update();
+
+                    // Store the initial camera state for animation
+                    resetCameraAnimation();
+
+                    // Ensure we start with the normal texture shader (original material)
+                    if (usingCustomShader) {
+                        toggleMaterial(); // Toggle to original material if we're using custom shader
+                    }
+
+                    console.log('Initial shader state: original material (normal texture)');
+                } else {
+                    console.warn('No meshes with geometry found in the model');
+                    controls.enabled = true;
+                }
+
+                // Apply custom shader by default
+                if (mesh) {
+                    toggleMaterial();
+                }
+
+                // Reset camera animation after model is loaded
+                resetCameraAnimation();
+
+                // Ensure we start with a consistent shader state (e.g., original material)
+                if (mesh) {
+                    // If we're using the custom shader, toggle to original material
+                    if (usingCustomShader) {
+                        toggleMaterial();
+                    }
+
+                    // Now we're guaranteed to be showing the original material
+                    console.log('Initial shader state: original material');
+                }
+
+                console.log(`Model ${filename} loaded successfully`);
+            }, undefined, (error) => {
+                console.error(`Error loading GLB ${filename}:`, error);
+            });
+        }
+
+        // Function to fit camera FOV to object bounding box
+        function fitCameraToObject(camera, boundingBox, centroid) {
+            // Get bounding box dimensions
+            const size = new THREE.Vector3();
+            boundingBox.getSize(size);
+
+            // Get the camera position
+            const cameraPosition = camera.position.clone();
+
+            // Calculate distance from camera to centroid
+            const distanceToCenter = cameraPosition.distanceTo(centroid);
+
+            // Calculate the required FOV
+            // We need to consider both horizontal and vertical dimensions
+            const aspect = window.innerWidth / window.innerHeight;
+
+            // Calculate the FOV needed for width and height
+            const boundingWidth = size.x;
+            const boundingHeight = size.y;
+
+            // Calculate the FOV in radians
+            const fovRadiansHeight = 2 * Math.atan(boundingHeight / (2 * distanceToCenter));
+            const fovRadiansWidth = 2 * Math.atan(boundingWidth / (2 * distanceToCenter * aspect));
+
+            // Use the larger FOV to ensure the entire object is visible
+            const fovRadians = Math.max(fovRadiansHeight, fovRadiansWidth);
+
+            // Convert to degrees and add a small margin (10%)
+            const fovDegrees = (fovRadians * 180 / Math.PI) * 1.1;
+
+            console.log('Calculated FOV:', fovDegrees);
+
+            // Update camera FOV
+            camera.fov = fovDegrees;
+            camera.updateProjectionMatrix();
+
+            return fovDegrees;
+        }
+
+        // Function to calculate normal-camera dot products for each triangle
+        function calculateNormalDotProducts(geometry, camera, object) {
+            const positionAttr = geometry.attributes.position;
+            const indexAttr = geometry.index;
+            const triangleCount = indexAttr ? indexAttr.count / 3 : positionAttr.count / 3;
+            const dotProducts = new Float32Array(triangleCount);
+
+            // Camera position in world space
+            const cameraPosition = new THREE.Vector3();
+            camera.getWorldPosition(cameraPosition);
+
+            // Object's world matrix for transforming positions and normals
+            const worldMatrix = object.matrixWorld;
+            const normalMatrix = new THREE.Matrix3().getNormalMatrix(worldMatrix);
+
+            // Temporary vectors
+            const v0 = new THREE.Vector3();
+            const v1 = new THREE.Vector3();
+            const v2 = new THREE.Vector3();
+            const normal = new THREE.Vector3();
+            const edge1 = new THREE.Vector3();
+            const edge2 = new THREE.Vector3();
+            const center = new THREE.Vector3();
+            const viewDirection = new THREE.Vector3();
+
+            // Calculate dot product for each triangle
+            for (let i = 0; i < triangleCount; i++) {
+                // Get vertex indices
+                let idx0, idx1, idx2;
+                if (indexAttr) {
+                    idx0 = indexAttr.getX(i * 3);
+                    idx1 = indexAttr.getX(i * 3 + 1);
+                    idx2 = indexAttr.getX(i * 3 + 2);
+                } else {
+                    idx0 = i * 3;
+                    idx1 = i * 3 + 1;
+                    idx2 = i * 3 + 2;
+                }
+
+                // Get vertex positions in local space
+                v0.set(
+                    positionAttr.getX(idx0),
+                    positionAttr.getY(idx0),
+                    positionAttr.getZ(idx0)
+                );
+                v1.set(
+                    positionAttr.getX(idx1),
+                    positionAttr.getY(idx1),
+                    positionAttr.getZ(idx1)
+                );
+                v2.set(
+                    positionAttr.getX(idx2),
+                    positionAttr.getY(idx2),
+                    positionAttr.getZ(idx2)
+                );
+
+                // Calculate triangle normal in local space
+                edge1.subVectors(v1, v0);
+                edge2.subVectors(v2, v0);
+                normal.crossVectors(edge1, edge2).normalize();
+
+                // Transform vertices and normal to world space
+                v0.applyMatrix4(worldMatrix);
+                v1.applyMatrix4(worldMatrix);
+                v2.applyMatrix4(worldMatrix);
+                normal.applyMatrix3(normalMatrix).normalize();
+
+                // Calculate triangle center in world space
+                center.addVectors(v0, v1).add(v2).multiplyScalar(1 / 3);
+
+                // Calculate view direction from camera to triangle center
+                viewDirection.subVectors(center, cameraPosition).normalize();
+
+                // Calculate absolute value of dot product between normal and view direction
+                // This gives us how aligned the normal is with the view direction
+                // 0 = perpendicular (most stretched), 1 = parallel (least stretched)
+                const dotProduct = Math.abs(normal.dot(viewDirection));
+
+                // Store the dot product
+                dotProducts[i] = dotProduct;
+            }
+
+            return dotProducts;
+        }
+
+        // Function to create a render target for pixel counting
+        function createTriangleCountingRenderer(width, height) {
+            // Create a render target
+            const renderTarget = new THREE.WebGLRenderTarget(width, height, {
+                format: THREE.RGBAFormat,
+                type: THREE.UnsignedByteType
+            });
+
+            // Create a scene for rendering triangles with unique colors
+            const countingScene = new THREE.Scene();
+            countingScene.background = new THREE.Color(0x000000); // Black background
+
+            return {
+                renderTarget,
+                countingScene
+            };
+        }
+
+        // Create a material that assigns a unique color to each triangle
+        function createTriangleIDMaterial(triangleCount) {
+            // Create a map of triangle IDs to colors
+            triangleColorMap = new Map();
+
+            return new THREE.ShaderMaterial({
+                vertexShader: `
+                    in float triangleId;
+                    flat out float vTriangleId;
+                    void main() {
+                        vTriangleId = triangleId;
+                        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+                    }
+                `,
+                fragmentShader: `
+                    flat in float vTriangleId;
+                    out vec4 fragColor;
+                    
+                    void main() {
+                        // Convert triangle ID to a unique RGB color
+                        float id = vTriangleId;
+                        float r = mod(id, 256.0) / 255.0;
+                        float g = mod(floor(id / 256.0), 256.0) / 255.0;
+                        float b = mod(floor(id / 65536.0), 256.0) / 255.0;
+                        
+                        fragColor = vec4(r, g, b, 1.0);
+                    }
+                `,
+                glslVersion: THREE.GLSL3
+            });
+        }
+
+        // Function to count pixels for each triangle
+        function countTrianglePixels(renderer, renderTarget, triangleCount) {
+            // Read pixels from the render target
+            const width = renderTarget.width;
+            const height = renderTarget.height;
+            const pixelBuffer = new Uint8Array(width * height * 4);
+
+            renderer.readRenderTargetPixels(renderTarget, 0, 0, width, height, pixelBuffer);
+
+            // Count pixels for each triangle
+            const pixelCounts = new Float32Array(triangleCount);
+
+            for (let i = 0; i < pixelBuffer.length; i += 4) {
+                if (pixelBuffer[i + 3] === 0) continue; // Skip transparent pixels
+
+                // Convert RGB color back to triangle ID
+                const r = pixelBuffer[i];
+                const g = pixelBuffer[i + 1];
+                const b = pixelBuffer[i + 2];
+
+                const triangleId = r + (g * 256) + (b * 65536);
+
+                if (triangleId < triangleCount) {
+                    pixelCounts[triangleId]++;
+                }
+            }
+
+            return pixelCounts;
+        }
+
+        // Modified toggle function
+        function toggleMaterial() {
+            if (!mesh) return;
+
+            if (usingCustomShader) {
+                // Switch to original material but make it visible without lighting
+                if (originalMaterials.has(mesh)) {
+                    const originalMaterial = originalMaterials.get(mesh);
+
+                    // Log information about the original material
+                    console.log("Original material type:", originalMaterial.type);
+                    console.log("Has map texture:", !!originalMaterial.map);
+
+                    // Create a new MeshBasicMaterial that always shows the texture regardless of lighting
+                    let brightMaterial;
+
+                    if (originalMaterial.map) {
+                        // If the original material has a texture map, use it
+                        brightMaterial = new THREE.MeshBasicMaterial({
+                            map: originalMaterial.map,
+                            color: 0xffffff, // Full white to show texture at full brightness
+                            side: originalMaterial.side || THREE.FrontSide
+                        });
+                        console.log("Using texture from original material");
+                    } else if (originalMaterial.color) {
+                        // If it has a color, use that
+                        brightMaterial = new THREE.MeshBasicMaterial({
+                            color: originalMaterial.color,
+                            side: originalMaterial.side || THREE.FrontSide
+                        });
+                        console.log("Using color from original material:", originalMaterial.color);
+                    } else {
+                        // Fallback to a light grey
+                        brightMaterial = new THREE.MeshBasicMaterial({
+                            color: 0xdddddd,
+                            side: originalMaterial.side || THREE.FrontSide
+                        });
+                        console.log("Using default light grey color");
+                    }
+
+                    // Copy other relevant properties
+                    if (originalMaterial.transparent) {
+                        brightMaterial.transparent = true;
+                        brightMaterial.opacity = originalMaterial.opacity;
+                    }
+
+                    // Apply the new material
+                    mesh.material = brightMaterial;
+
+                    // Add ambient light to the scene to ensure everything is visible
+                    if (!scene.getObjectByName("ambientLight")) {
+                        const ambientLight = new THREE.AmbientLight(0xffffff, 1.0);
+                        ambientLight.name = "ambientLight";
+                        scene.add(ambientLight);
+                        console.log("Added ambient light to scene");
+                    }
+                } else {
+                    console.warn("No original material found for mesh");
+                    // Create a simple bright material as fallback
+                    mesh.material = new THREE.MeshBasicMaterial({ color: 0xdddddd });
+                }
+
+                hasCalculatedInitialCounts = false; // Reset when switching back to original
+            } else {
+                // Store the current material if it's not already stored
+                if (!originalMaterials.has(mesh)) {
+                    originalMaterials.set(mesh, mesh.material.clone());
+                    console.log("Stored original material");
+                }
+
+                // Initialize the render target and counting scene with higher resolution
+                const renderTargetSize = {
+                    width: renderer.domElement.width / 2,
+                    height: renderer.domElement.height / 2
+                };
+
+                const result = createTriangleCountingRenderer(
+                    renderTargetSize.width,
+                    renderTargetSize.height
+                );
+
+                renderTarget = result.renderTarget;
+                countingScene = result.countingScene;
+
+                // Create triangle ID material
+                const geometry = mesh.geometry;
+                const triangleCount = geometry.index ? geometry.index.count / 3 : geometry.attributes.position.count / 3;
+
+                // Ensure geometry has triangleId attribute
+                if (!geometry.attributes.triangleId) {
+                    if (geometry.index) {
+                        const indexCount = geometry.index.count;
+                        const triangleIds = new Float32Array(indexCount);
+
+                        for (let i = 0; i < indexCount; i++) {
+                            triangleIds[i] = Math.floor(i / 3); // Integer ID per triangle
+                        }
+
+                        geometry.setAttribute('triangleId', new THREE.BufferAttribute(triangleIds, 1));
+                    } else {
+                        const vertexCount = geometry.attributes.position.count;
+                        const triangleIds = new Float32Array(vertexCount);
+
+                        for (let i = 0; i < vertexCount; i++) {
+                            triangleIds[i] = Math.floor(i / 3); // Integer ID per triangle
+                        }
+
+                        geometry.setAttribute('triangleId', new THREE.BufferAttribute(triangleIds, 1));
+                    }
+                }
+
+                // Create a clone of the mesh with triangle ID material for counting
+                const idMaterial = createTriangleIDMaterial(triangleCount);
+                const countingMesh = mesh.clone();
+                countingMesh.material = idMaterial;
+                countingScene.add(countingMesh);
+
+                // Render the counting scene to get initial pixel counts
+                renderer.setRenderTarget(renderTarget);
+                renderer.render(countingScene, camera);
+                renderer.setRenderTarget(null);
+
+                // Count pixels for each triangle
+                initialPixelCounts = countTrianglePixels(renderer, renderTarget, triangleCount);
+                hasCalculatedInitialCounts = true;
+
+                // Log some statistics about initial pixel counts
+                let totalPixels = 0;
+                let minPixels = Infinity;
+                let maxPixels = 0;
+                let zeroCount = 0;
+
+                for (let i = 0; i < initialPixelCounts.length; i++) {
+                    totalPixels += initialPixelCounts[i];
+                    minPixels = Math.min(minPixels, initialPixelCounts[i]);
+                    maxPixels = Math.max(maxPixels, initialPixelCounts[i]);
+                    if (initialPixelCounts[i] === 0) zeroCount++;
+                }
+
+                console.log(`Initial pixel count stats:
+                    Total triangles: ${initialPixelCounts.length}
+                    Total pixels: ${totalPixels}
+                    Min pixels per triangle: ${minPixels}
+                    Max pixels per triangle: ${maxPixels}
+                    Triangles with zero pixels: ${zeroCount}
+                `);
+
+                // Create a simple initial shader for the main view
+                const visualizationMaterial = new THREE.ShaderMaterial({
+                    vertexShader: `
+                        in float triangleId;
+                        flat out float vTriangleId;
+                        void main() {
+                            vTriangleId = triangleId;
+                            gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+                        }
+                    `,
+                    fragmentShader: `
+                        flat in float vTriangleId;
+                        out vec4 fragColor;
+                        
+                        void main() {
+                            // Initial state - medium gray for all triangles
+                            fragColor = vec4(0.5, 0.5, 0.5, 1.0);
+                        }
+                    `,
+                    glslVersion: THREE.GLSL3
+                });
+                mesh.material = visualizationMaterial;
+            }
+
+            usingCustomShader = !usingCustomShader;
+        }
+
+        // Add a button to toggle the material
+        const toggleButton = document.createElement('button');
+        toggleButton.textContent = 'Toggle inpaint shader';
+        toggleButton.style.position = 'absolute';
+        toggleButton.style.top = '10px';
+        toggleButton.style.right = '10px';
+        toggleButton.style.padding = '8px 16px';
+        toggleButton.style.zIndex = '100';
+        toggleButton.addEventListener('click', toggleMaterial);
+        document.body.appendChild(toggleButton);
+
+        // Update the animation loop to handle shader toggling only on specific cycles
+        function animate() {
+            requestAnimationFrame(animate);
+            frameCount++;
+
+            // Camera animation logic
+            if (cameraAnimationState.isActive) {
+                const currentTime = Date.now();
+                const elapsedTime = (currentTime - cameraAnimationState.startTime) / 1000; // in seconds
+
+                // Calculate the time within the current cycle
+                const cycleTime = elapsedTime % cameraAnimationState.cycleDuration;
+
+                // Calculate current cycle number (0-based)
+                const currentCycle = Math.floor(elapsedTime / cameraAnimationState.cycleDuration);
+
+                // Check if we're starting a new cycle
+                if (cycleTime < 0.1 && frameCount % 10 === 0) { // Check only occasionally to avoid multiple toggles
+                    // Get the previous cycle number
+                    const previousCycle = Math.floor((elapsedTime - 0.2) / cameraAnimationState.cycleDuration);
+
+                    // If we've moved to a new cycle
+                    if (currentCycle > previousCycle) {
+                        console.log(`Starting new camera animation cycle: ${currentCycle}`);
+
+                        // Toggle shader only when entering cycle 1 (second cycle) or cycle 2 (third cycle)
+                        if (currentCycle === 1 || currentCycle === 2) {
+                            toggleMaterial();
+                            console.log(`Toggled shader state to: ${usingCustomShader ? 'custom shader' : 'original material'}`);
+                        }
+                    }
+                }
+
+                // Wait 3 seconds before starting movement
+                if (cycleTime > 3 && cycleTime <= 13) { // 10 seconds of movement
+                    // Calculate animation progress (0 to 1 to 0)
+                    let progress;
+                    if (cycleTime <= 8) { // First 5 seconds - move forward
+                        progress = (cycleTime - 3) / 5;
+                    } else { // Next 5 seconds - move back
+                        progress = 1 - ((cycleTime - 8) / 5);
+                    }
+
+                    // Clamp progress between 0 and 1
+                    progress = Math.max(0, Math.min(1, progress));
+
+                    // Calculate new camera position
+                    // Move forward in look direction and increase height
+                    const forwardDistance = -10 * progress; // Max 2 meters forward
+                    const heightIncrease = 0.5 * progress; // Max 0.5 meters up
+
+                    // Set new camera position
+                    camera.position.copy(cameraAnimationState.originalPosition);
+                    camera.position.addScaledVector(cameraAnimationState.lookDirection, forwardDistance);
+                    camera.position.y += heightIncrease;
+
+                    // Keep looking at the model centroid
+                    camera.lookAt(modelCentroid);
+                    controls.update();
+                }
+                else {
+                    // During wait periods, reset to original position
+                    camera.position.copy(cameraAnimationState.originalPosition);
+                    camera.rotation.copy(cameraAnimationState.originalRotation);
+                    controls.update();
+                }
+            }
+
+            // Existing shader update code - only run when custom shader is active
+            if (mesh && usingCustomShader && hasCalculatedInitialCounts && frameCount % updateInterval === 0) {
+                try {
+                    // Render the counting scene with the current camera position
+                    renderer.setRenderTarget(renderTarget);
+                    renderer.render(countingScene, camera);
+                    renderer.setRenderTarget(null);
+
+                    // Count pixels for each triangle
+                    const triangleCount = initialPixelCounts.length;
+                    const currentPixelCounts = countTrianglePixels(renderer, renderTarget, triangleCount);
+
+                    // Calculate pixel count differences
+                    const pixelDifferences = new Float32Array(triangleCount);
+                    let minRatio = Infinity;
+                    let maxRatio = -Infinity;
+                    const smoothingFactor = 0.1; // Smoothing factor to avoid division by zero
+
+                    // Log statistics for current frame
+                    let totalCurrentPixels = 0;
+                    let totalInitialPixels = 0;
+                    let zeroToNonZero = 0;
+                    let nonZeroToZero = 0;
+
+                    for (let i = 0; i < triangleCount; i++) {
+                        const initialCount = initialPixelCounts[i];
+                        const currentCount = currentPixelCounts[i];
+
+                        totalInitialPixels += initialCount;
+                        totalCurrentPixels += currentCount;
+
+                        if (initialCount === 0 && currentCount > 0) zeroToNonZero++;
+                        if (initialCount > 0 && currentCount === 0) nonZeroToZero++;
+
+                        // Calculate the ratio with smoothing factor to avoid division by zero
+                        pixelDifferences[i] = (initialCount + smoothingFactor) / (currentCount + smoothingFactor);
+
+                        // Track min and max for normalization
+                        minRatio = Math.min(minRatio, pixelDifferences[i]);
+                        maxRatio = Math.max(maxRatio, pixelDifferences[i]);
+                    }
+
+                    /*console.log(`Frame ${frameCount} pixel stats:
+                        Total initial pixels: ${totalInitialPixels}
+                        Total current pixels: ${totalCurrentPixels}
+                        Change: ${((totalCurrentPixels - totalInitialPixels) / totalInitialPixels * 100).toFixed(2)}%
+                        Triangles appearing: ${zeroToNonZero}
+                        Triangles disappearing: ${nonZeroToZero}
+                        Diff range: ${minDiff.toFixed(4)} to ${maxDiff.toFixed(4)}
+                    `);*/
+
+                    // Ensure we have a reasonable range
+                    if (maxRatio - minRatio < 0.001) {
+                        maxRatio = minRatio + 0.001;
+                    }
+
+                    // Create or update data texture
+                    const textureSize = Math.ceil(Math.sqrt(pixelDifferences.length));
+                    const paddedData = new Float32Array(textureSize * textureSize);
+                    for (let i = 0; i < pixelDifferences.length; i++) {
+                        paddedData[i] = pixelDifferences[i];
+                    }
+
+                    if (!dataTexture) {
+                        dataTexture = new THREE.DataTexture(
+                            paddedData,
+                            textureSize,
+                            textureSize,
+                            THREE.RedFormat,
+                            THREE.FloatType
+                        );
+                    } else {
+                        dataTexture.image.data = paddedData;
+                    }
+                    dataTexture.needsUpdate = true;
+
+                    // Create a new shader material with the texture
+                    const updatedMaterial = new THREE.ShaderMaterial({
+                        uniforms: {
+                            pixelDiffTexture: { value: dataTexture },
+                            textureSize: { value: textureSize },
+                            minRatio: { value: minRatio },
+                            maxRatio: { value: maxRatio },
+                            ratioThreshold: { value: 1.0 }, // Threshold between inpaint needed vs not needed
+                            sigmoidSteepness: { value: 6.0 } // Controls how steep the sigmoid curve is
+                        },
+                        vertexShader: `
+                            in float triangleId;
+                            flat out float vTriangleId;
+                            void main() {
+                                vTriangleId = triangleId;
+                                gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+                            }
+                        `,
+                        fragmentShader: `
+                            uniform sampler2D pixelDiffTexture;
+                            uniform float textureSize;
+                            uniform float minRatio;
+                            uniform float maxRatio;
+                            uniform float ratioThreshold;
+                            uniform float sigmoidSteepness;
+                            flat in float vTriangleId;
+                            out vec4 fragColor;
+                            
+                            // Sigmoid function to create smooth transition
+                            float sigmoid(float x) {
+                                return 1.0 / (1.0 + exp(-x));
+                            }
+                            
+                            void main() {
+                                // Calculate texture coordinates from triangle ID
+                                float triangleId = vTriangleId;
+                                float texSize = textureSize;
+                                float y = floor(triangleId / texSize);
+                                float x = mod(triangleId, texSize);
+                                vec2 uv = vec2((x + 0.5) / texSize, (y + 0.5) / texSize);
+                                
+                                // Get pixel ratio from texture
+                                float ratio = texture(pixelDiffTexture, uv).r;
+                                
+                                // Center sigmoid around ratio = 1.0 (log(1.0) = 0)
+                                // This way, a ratio of 1.0 will be in the middle of our transition
+                                float logRatio = log(ratio);
+                                
+                                // Apply sigmoid function centered at ratio = 1.0
+                                float sigmoidValue = sigmoid(sigmoidSteepness * logRatio);
+                                
+                                // Use a cleaner color mapping scheme
+                                // For ratios < 1.0: more visible now (blue to gray)
+                                // For ratios > 1.0: less visible now, needs inpainting (gray to yellow/orange)
+                                vec3 lowColor = vec3(0.0, 0.2, 0.6);  // Dark blue for much more visible triangles
+                                vec3 midColor = vec3(0.5, 0.5, 0.5);  // Gray for unchanged triangles
+                                vec3 highColor = vec3(1.0, 0.7, 0.0);  // Bright orange for triangles needing inpainting
+                                
+                                // Direct mapping from sigmoid output to color
+                                // When ratio = 1.0, sigmoid = 0.5, so we get midColor
+                                // Calculate mix factors that accurately correspond to the ratio values
+                                float lowToMidFactor = min(sigmoidValue * 2.0, 1.0);  // 0->0, 0.5->1.0
+                                float midToHighFactor = max(sigmoidValue * 2.0 - 1.0, 0.0);  // 0.5->0, 1.0->1.0
+                                
+                                // Choose color based on whether ratio is above or below 1.0
+                                vec3 color = ratio < 1.0 ? 
+                                    mix(lowColor, midColor, lowToMidFactor) : 
+                                    mix(midColor, highColor, midToHighFactor);
+                                
+                                fragColor = vec4(color, 1.0);
+                            }
+                        `,
+                        glslVersion: THREE.GLSL3
+                    });
+
+                    // Replace the material
+                    mesh.material = updatedMaterial;
+                } catch (error) {
+                    console.error("Error in animation loop:", error);
+                }
+            }
+
+            controls.update();
+            renderer.render(scene, camera);
+        }
+        animate();
+
+        // Handle window resize
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+    </script>
+</body>
+
+</html>
